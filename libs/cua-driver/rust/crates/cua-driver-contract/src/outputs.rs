@@ -79,6 +79,7 @@ fn strip_schema_titles(value: &mut Value) {
         Value::Object(object) => {
             object.remove("title");
             object.remove("description");
+            crate::inputs::normalize_unsigned_format(object);
             for child in object.values_mut() {
                 strip_schema_titles(child);
             }

@@ -41,6 +41,7 @@ fn normalize_schema(value: &mut Value) {
                     .entry("additionalProperties")
                     .or_insert(Value::Bool(true));
             }
+            normalize_unsigned_format(object);
             for child in object.values_mut() {
                 normalize_schema(child);
             }
@@ -51,6 +52,24 @@ fn normalize_schema(value: &mut Value) {
             }
         }
         _ => {}
+    }
+}
+
+/// Rewrite non-standard unsigned integer formats (`uint8`…`uint64`) to their
+/// signed JSON Schema counterparts (`int8`…`int64`).
+///
+/// schemars derives unsigned Rust integers as `format: "uintN"`, which is an
+/// OpenAPI extension unknown to most JSON Schema validators (MCP clients such
+/// as opencode print `unknown format "uint64" ignored` warnings on every
+/// connect). `int32`/`int64` are the recognized equivalents; range enforcement
+/// stays with the Rust deserializer, which rejects out-of-range values anyway.
+pub(crate) fn normalize_unsigned_format(object: &mut serde_json::Map<String, Value>) {
+    if let Some(format) = object.get("format").and_then(Value::as_str) {
+        if let Some(width) = format.strip_prefix("uint") {
+            if !width.is_empty() && width.bytes().all(|b| b.is_ascii_digit()) {
+                object.insert("format".into(), Value::String(format!("int{width}")));
+            }
+        }
     }
 }
 
