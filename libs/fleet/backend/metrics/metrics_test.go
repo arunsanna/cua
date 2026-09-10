@@ -41,6 +41,43 @@ func TestMiddlewareRecordsUnknownUserByDefault(t *testing.T) {
 	}
 }
 
+func TestMiddlewareNormalizesSignedServicePaths(t *testing.T) {
+	const (
+		token  = "signed-capability-token-must-not-leak"
+		suffix = "arbitrary-suffix-must-not-leak"
+	)
+
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	for _, testCase := range []struct {
+		path string
+		want string
+	}{
+		{"/api/signed-svc/" + token, "/api/signed-svc/:token"},
+		{"/api/signed-svc/" + token + "/tools/" + suffix, "/api/signed-svc/:token/:path"},
+	} {
+		handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, testCase.path, nil))
+
+		if count := histogramCount(t, map[string]string{
+			"method":      "GET",
+			"path":        testCase.want,
+			"status_code": "200",
+			"user":        "unknown",
+		}); count != 1 {
+			t.Fatalf("normalized signed service path %q count = %d, want 1", testCase.want, count)
+		}
+		if count := histogramCount(t, map[string]string{
+			"method":      "GET",
+			"path":        testCase.path,
+			"status_code": "200",
+			"user":        "unknown",
+		}); count != 0 {
+			t.Fatalf("signed service request leaked raw path label %q", testCase.path)
+		}
+	}
+}
+
 func histogramCount(t *testing.T, labels map[string]string) uint64 {
 	t.Helper()
 	families, err := prometheus.DefaultGatherer.Gather()
@@ -78,7 +115,6 @@ func TestNormalizePath(t *testing.T) {
 		{"/api/gateway/mypool/vms/list", "/api/gateway/:name/:path"},
 		{"/api/svc/pool-mypool/my-svc/health", "/api/svc/:namespace/:service/:path"},
 		{"/api/svc/pool-mypool/my-svc", "/api/svc/:namespace/:service/:path"},
-		{"/api/orch/myns/svc/api/vms", "/api/orch/:namespace/:service/:path"},
 		{"/api/k8s/api/v1/pods", "/api/k8s/:path"},
 		{"/api/k8s/apis/apps/v1/deployments", "/api/k8s/:path"},
 		{"/api/swagger/doc.json", "/api/swagger/doc.json"},
