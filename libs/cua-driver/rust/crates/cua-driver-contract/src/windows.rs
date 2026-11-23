@@ -19,6 +19,9 @@ fn pid_schema(_: &mut SchemaGenerator) -> Schema {
 fn positive_integer_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":"integer", "minimum":1})
 }
+fn nonnegative_integer_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({"type":"integer", "minimum":0})
+}
 
 fn nullable_pid_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":["integer","null"], "minimum":0, "maximum":4294967295_u64})
@@ -89,6 +92,57 @@ pub struct GetWindowStateInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "positive_integer_schema")]
     pub max_dimension: Option<u32>,
+    /// Optional per-call long-edge ceiling. Zero requests native resolution;
+    /// omit it to preserve the configured session or global behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "nonnegative_integer_schema")]
+    pub max_image_dimension: Option<u32>,
+    /// Wall-clock budget for the accessibility walk in milliseconds
+    /// (default 1000 on every platform). A walk that runs out returns a
+    /// partial tree flagged `truncated` rather than failing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "timeout_ms_schema")]
+    #[uniffi(default = None)]
+    pub timeout_ms: Option<u32>,
+    /// Tree representation to return: `markdown` (default), `elements`, or
+    /// `both`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "tree_format_schema")]
+    #[uniffi(default = None)]
+    pub tree_format: Option<String>,
+    /// Return only what changed since this earlier `snapshot_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    #[uniffi(default = None)]
+    pub since: Option<String>,
+    /// Include `_note` and the full `background_input` report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
+    pub verbose: Option<bool>,
+    /// Restore the previous full response (both representations, all
+    /// metadata, platform walk limits).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
+    pub full_output: Option<bool>,
+}
+
+fn tree_format_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type":"string", "enum":["markdown","elements","both"]})
+}
+
+/// Bounds of the accessibility-walk budget, shared with every live backend
+/// schema (`cua_driver_core::tool_schema::timeout_ms_schema`).
+pub const TIMEOUT_MS_MIN: u32 = 100;
+pub const TIMEOUT_MS_MAX: u32 = 120_000;
+
+fn timeout_ms_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "integer",
+        "minimum": TIMEOUT_MS_MIN,
+        "maximum": TIMEOUT_MS_MAX
+    })
 }
 
 impl ToolInput for GetWindowStateInput {
@@ -99,6 +153,14 @@ impl ToolInput for GetWindowStateInput {
         }
         if [self.max_elements, self.max_depth, self.max_dimension].contains(&Some(0)) {
             return Err("window observation limits must be positive".into());
+        }
+        if self
+            .timeout_ms
+            .is_some_and(|ms| !(TIMEOUT_MS_MIN..=TIMEOUT_MS_MAX).contains(&ms))
+        {
+            return Err(format!(
+                "timeout_ms must be between {TIMEOUT_MS_MIN} and {TIMEOUT_MS_MAX} milliseconds"
+            ));
         }
         if self.include_accessibility_tree == Some(false) && self.include_screenshot == Some(false)
         {
@@ -215,10 +277,18 @@ pub struct WindowElement {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<bool>,
+    /// Whether the element is a password field. Windows reports it from UIA
+    /// `IsPassword`: `false` only on `Edit` controls, absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_password: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_web_content: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<String>>,
+    /// macOS only: application-defined actions, with a readable name and the
+    /// exact action envelope accepted by `click`. Windows and Linux omit this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_actions: Option<Vec<ElementCustomAction>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_index: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +297,32 @@ pub struct WindowElement {
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
+}
+
+/// A readable native row with no action handle: static text, a label, a
+/// read-only value. It comes from the same walk as `elements`, carries no
+/// `element_index` or `element_token`, and no action tool accepts it.
+/// `parent_index` names the nearest addressable ancestor in `elements`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+pub struct WindowObservation {
+    pub role: String,
+    pub depth: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame: Option<ElementFrame>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_web_content: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+pub struct ElementCustomAction {
+    pub name: String,
+    pub raw: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
@@ -249,6 +345,13 @@ pub struct WindowStateOutput {
     pub tree_markdown: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elements: Option<Vec<WindowElement>>,
+    /// Display-only rows of the same walk. Absent means the platform did not
+    /// observe them, never that the window has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations: Option<Vec<WindowObservation>>,
+    /// True when `observations` stopped at its row cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations_truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -267,6 +370,24 @@ pub struct WindowStateOutput {
     pub truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_reason: Option<String>,
+    /// Plain-language line saying the tree was cut at `max_elements` and how
+    /// to read more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_hint: Option<String>,
+    /// Which representation this response carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_format: Option<String>,
+    /// The `since` snapshot_id the caller asked to diff against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// `diff`, `no_change`, or the reason a full read was returned instead
+    /// (`unknown_snapshot`, `other_window`, `view_changed`, `too_much_changed`,
+    /// `diff_too_large`, `no_snapshot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_status: Option<String>,
+    /// Added/changed/removed rows against `since`, one per line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_diff: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -398,6 +519,21 @@ mod tests {
             GetWindowStateInput::input_schema()["properties"]["max_elements"]["minimum"],
             1
         );
+        assert_eq!(
+            GetWindowStateInput::input_schema()["properties"]["max_image_dimension"]["minimum"],
+            0
+        );
+        assert_eq!(
+            GetWindowStateInput::input_schema()["properties"]["max_dimension"]["minimum"],
+            1
+        );
+        let native_resolution: GetWindowStateInput = serde_json::from_value(json!({
+            "pid": 7,
+            "window_id": 9,
+            "max_image_dimension": 0
+        }))
+        .unwrap();
+        native_resolution.validate().unwrap();
         assert_eq!(ListAppsInput::input_schema()["properties"], json!({}));
     }
 

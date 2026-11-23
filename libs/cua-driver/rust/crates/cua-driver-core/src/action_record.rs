@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Internal, non-wire representation of what an action actually did.
 //!
 //! This deliberately has no serde derives: it is the driver's source of truth,
@@ -64,6 +67,9 @@ pub enum ActionTransport {
     MacosAxWindowFrame,
     MacosCgEventPid,
     MacosCgEventHid,
+    /// An Apple Event to the target app's scripting interface (Finder
+    /// rename, a document save), which never activates the app.
+    MacosAppleEvent,
     WindowsUiaInvoke,
     WindowsUiaToggle,
     WindowsUiaSelection,
@@ -83,6 +89,10 @@ pub enum ActionTransport {
     LinuxPty,
     LinuxXSendEvent,
     LinuxXTest,
+    /// X11 XInput2 MPX virtual master pointer/keyboard fed by a uinput slave:
+    /// real (non-synthetic) events aimed at one window without touching the
+    /// user's core focus or pointer.
+    LinuxX11MpxUinput,
     LinuxLibei,
     LinuxWaylandVirtualPointer,
     LinuxCuaCompositorInject,
@@ -102,6 +112,7 @@ impl ActionTransport {
         Self::MacosAxWindowFrame,
         Self::MacosCgEventPid,
         Self::MacosCgEventHid,
+        Self::MacosAppleEvent,
         Self::WindowsUiaInvoke,
         Self::WindowsUiaToggle,
         Self::WindowsUiaSelection,
@@ -121,6 +132,7 @@ impl ActionTransport {
         Self::LinuxPty,
         Self::LinuxXSendEvent,
         Self::LinuxXTest,
+        Self::LinuxX11MpxUinput,
         Self::LinuxLibei,
         Self::LinuxWaylandVirtualPointer,
         Self::LinuxCuaCompositorInject,
@@ -159,11 +171,14 @@ impl ActionTransport {
             | Self::WindowsSetCursorPos
             | Self::WindowsShellExecute
             | Self::LinuxXTest
+            | Self::LinuxX11MpxUinput
             | Self::LinuxLibei
             | Self::LinuxWaylandVirtualPointer
             | Self::LinuxHyprlandForegroundInput
             | Self::LinuxCuaCompositorInject => ActionRoute::GlobalInput,
-            Self::WindowsSetWindowPos | Self::LinuxX11ConfigureWindow => ActionRoute::SystemApi,
+            Self::WindowsSetWindowPos | Self::LinuxX11ConfigureWindow | Self::MacosAppleEvent => {
+                ActionRoute::SystemApi
+            }
             Self::BrowserCdpRuntimeFunction => ActionRoute::Dom,
             Self::BrowserCdpInputMouse | Self::BrowserCdpInputKey => ActionRoute::TrustedInput,
         }
@@ -236,6 +251,13 @@ pub enum EscalationKind {
     RetryWithForegroundDelivery,
 }
 
+/// Why a refused action sent no input, in the words the caller can act on.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActionRefusal {
+    pub code: String,
+    pub hint: Option<String>,
+}
+
 /// Complete internal accounting for one action execution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ActionExecutionRecord {
@@ -249,6 +271,7 @@ pub struct ActionExecutionRecord {
     pub escalation: Option<ActionEscalation>,
     pub delivered_count: Option<u32>,
     pub detail: Option<String>,
+    pub refusal: Option<ActionRefusal>,
 }
 
 impl ActionExecutionRecord {
@@ -268,6 +291,7 @@ impl ActionExecutionRecord {
             escalation: None,
             delivered_count: None,
             detail: None,
+            refusal: None,
         }
     }
 
@@ -277,6 +301,19 @@ impl ActionExecutionRecord {
         requested_delivery: RequestedDelivery,
     ) -> ActionExecutionRecordBuilder {
         ActionExecutionRecordBuilder::new(effect, transport, requested_delivery)
+    }
+
+    /// A `move_cursor` record. A cursor move gives an app nothing to confirm,
+    /// so the effect is unverifiable and no app delivery applies, whether the
+    /// user's real pointer or only the drawn agent cursor moved.
+    pub fn cursor_move(transport: ActionTransport, args: &serde_json::Value) -> Self {
+        let mut record = Self::new(
+            ActionEffect::Unverifiable,
+            transport,
+            requested_delivery("move_cursor", args),
+        );
+        record.actual_delivery = Some(ActualDelivery::NotApplicable);
+        record
     }
 
     pub fn validate(&self) -> Result<(), ActionRecordValidationError> {
@@ -360,6 +397,7 @@ impl ActionExecutionRecord {
                 evidence
                     .into_iter()
                     .map(|evidence| cua_driver_contract::ActionEvidence {
+                        detail: (!evidence.detail.is_empty()).then(|| evidence.detail.clone()),
                         kind: match evidence.kind {
                             ProjectedEvidenceKind::AccessibilityReadback
                             | ProjectedEvidenceKind::BrowserReadback
@@ -420,6 +458,25 @@ impl ActionExecutionRecord {
                     },
                 }
             }),
+            // The dispatch seam attaches the producer's text as the summary;
+            // the record itself never carries prose that could echo request
+            // data.
+            summary: None,
+            error: match projection.effect {
+                ActionEffect::Refused => {
+                    self.refusal
+                        .as_ref()
+                        .map(|refusal| cua_driver_contract::ActionError {
+                            code: refusal.code.clone(),
+                            hint: refusal.hint.clone(),
+                        })
+                }
+                _ => None,
+            },
+            // The dispatch seam adds these after the record is projected.
+            hint: None,
+            next_call: None,
+            fast_path: None,
         })
     }
 
@@ -438,15 +495,20 @@ impl ActionExecutionRecord {
         if !is_action_tool(tool_name) {
             return None;
         }
+        let effect = legacy_effect(structured);
+        // Every successful `move_cursor` producer attaches its own record;
+        // only its refusals still come through here.
+        if tool_name == "move_cursor" && effect != ActionEffect::Refused {
+            return None;
+        }
         let requested_delivery = requested_delivery(tool_name, args);
         let raw_path = structured
             .get("path")
             .or_else(|| structured.get("route"))
             .and_then(serde_json::Value::as_str);
         let transport = transport_from_legacy(tool_name, args, raw_path)?;
-        let effect = legacy_effect(structured);
         let actual_delivery =
-            actual_delivery_from_legacy(tool_name, args, structured, raw_path, transport, effect);
+            actual_delivery_from_legacy(tool_name, args, structured, raw_path, effect);
 
         let mut record = Self::new(effect, transport, requested_delivery);
         record.actual_delivery = actual_delivery;
@@ -471,7 +533,7 @@ impl ActionExecutionRecord {
                 detail: structured
                     .get("verify")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("confirmed")
+                    .unwrap_or_default()
                     .to_owned(),
             });
         }
@@ -500,6 +562,38 @@ impl ActionExecutionRecord {
             .and_then(serde_json::Value::as_str)
         {
             record.escalation = browser_refusal_escalation(code);
+        }
+        // Producers may declare explicit evidence items (`{kind, detail}`);
+        // only the kinds the public contract publishes can carry a
+        // `confirmed` effect (screenshot comparisons stay internal).
+        if let Some(items) = structured
+            .get("evidence")
+            .and_then(serde_json::Value::as_array)
+        {
+            for item in items {
+                let kind = match item.get("kind").and_then(serde_json::Value::as_str) {
+                    Some("accessibility_readback") => EvidenceKind::AccessibilityReadback,
+                    Some("browser_readback") => EvidenceKind::BrowserReadback,
+                    Some("value_readback") => EvidenceKind::ValueReadback,
+                    Some("window_change") => EvidenceKind::WindowChange,
+                    Some("native_api_result") => EvidenceKind::NativeApiResult,
+                    Some("screenshot_comparison") => EvidenceKind::ScreenshotComparison,
+                    Some("event_receipt") => EvidenceKind::EventReceipt,
+                    Some("operator_observation") => EvidenceKind::OperatorObservation,
+                    _ => continue,
+                };
+                let detail = item
+                    .get("detail")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                if !record.evidence.iter().any(|existing| existing.kind == kind) {
+                    record.evidence.push(ActionEvidence { kind, detail });
+                }
+            }
+        }
+        if effect == ActionEffect::Refused {
+            record.refusal = legacy_refusal(structured);
         }
         if effect == ActionEffect::Partial && record.delivered_count.is_none() {
             return None;
@@ -543,6 +637,10 @@ impl ActionExecutionRecord {
                 "detail": escalation.detail,
             })),
             "detail": self.detail,
+            "refusal": self.refusal.as_ref().map(|refusal| serde_json::json!({
+                "code": refusal.code,
+                "hint": refusal.hint,
+            })),
         })
     }
 }
@@ -570,6 +668,27 @@ fn requested_delivery(tool_name: &str, args: &serde_json::Value) -> RequestedDel
         }
         _ => RequestedDelivery::Background,
     }
+}
+
+/// The refusal code and hint a legacy payload carries, in either envelope
+/// (`{"refusal":{code,message}}` or `{"code":…, "hint"|"message":…}`).
+fn legacy_refusal(structured: &serde_json::Value) -> Option<ActionRefusal> {
+    let code = structured
+        .pointer("/refusal/code")
+        .or_else(|| structured.get("code"))
+        .and_then(serde_json::Value::as_str)?;
+    let hint = ["/refusal/hint", "/refusal/message", "/hint", "/message"]
+        .iter()
+        .find_map(|pointer| {
+            structured
+                .pointer(pointer)
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::to_owned);
+    Some(ActionRefusal {
+        code: code.to_owned(),
+        hint,
+    })
 }
 
 fn legacy_effect(structured: &serde_json::Value) -> ActionEffect {
@@ -683,18 +802,27 @@ fn transport_from_legacy(
         "msaa" => ActionTransport::WindowsMsaaAction,
         "post_message" | "PostMessage" => ActionTransport::WindowsPostMessage,
         "SendInput" => ActionTransport::WindowsSendInput,
-        "SetCursorPos" => ActionTransport::WindowsSetCursorPos,
         "atspi" | "wayland_atspi" | "x11_atspi" => ActionTransport::LinuxAtSpiAction,
         "pty" => ActionTransport::LinuxPty,
-        "x11_pixel" | "x11_pixel_fg" | "x11_xtest_fg" | "xtest" | "xtest_desktop" => {
-            ActionTransport::LinuxXTest
+        // set_value's keyboard fallback on Linux: the field (or combo box)
+        // is clicked open with the session's MPX pointer, or with XTest in
+        // the foreground, and typed into or picked from.
+        "mpx_uinput" | "mpx_pointer" | "click_type_mpx" | "click_select_mpx" => {
+            ActionTransport::LinuxX11MpxUinput
         }
+        "click_type_fg" | "click_select_fg" => ActionTransport::LinuxXTest,
+        "x11_xsendevent" => ActionTransport::LinuxXSendEvent,
+        "x11_pixel" | "x11_pixel_fg" | "x11_xtest_fg" | "xtest" | "xtest_desktop"
+        | "xtest_core_grab" => ActionTransport::LinuxXTest,
         "wayland_activate" | "wayland_focused" => ActionTransport::LinuxLibei,
         "wayland_desktop" => ActionTransport::LinuxWaylandVirtualPointer,
         "cua_compositor_inject" | "wayland_cua_compositor" => {
             ActionTransport::LinuxCuaCompositorInject
         }
         "hid" | "cgevent_hid" | "cgevent_fg" => ActionTransport::MacosCgEventHid,
+        // A GTK 3 app held AppKit-active by the activation event, with the
+        // click posted to its pid as NSEvent-built events.
+        "appkit_activated" => ActionTransport::MacosCgEventPid,
         "cgevent" => {
             if args
                 .get("delivery_mode")
@@ -767,6 +895,8 @@ fn transport_from_legacy(
             }
         }
         "" if tool_name == "browser_type" => ActionTransport::BrowserCdpInputKey,
+        // Only move_cursor refusals reach here: an agent-cursor or window
+        // move was aimed at the overlay.
         "" if tool_name == "move_cursor"
             && args.get("scope").and_then(serde_json::Value::as_str) != Some("desktop") =>
         {
@@ -858,7 +988,6 @@ fn actual_delivery_from_legacy(
     args: &serde_json::Value,
     structured: &serde_json::Value,
     raw_path: Option<&str>,
-    transport: ActionTransport,
     effect: ActionEffect,
 ) -> Option<ActualDelivery> {
     if effect == ActionEffect::Refused {
@@ -868,16 +997,19 @@ fn actual_delivery_from_legacy(
         tool_name,
         "browser_click" | "browser_pointer" | "browser_type"
     ) {
-        return Some(ActualDelivery::Background);
+        return match structured
+            .get("delivery_mode")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("foreground") => Some(ActualDelivery::Foreground),
+            _ => Some(ActualDelivery::Background),
+        };
     }
-    if transport == ActionTransport::AgentCursorOverlay
-        || args.get("scope").and_then(serde_json::Value::as_str) == Some("desktop")
-    {
+    if args.get("scope").and_then(serde_json::Value::as_str) == Some("desktop") {
         return Some(ActualDelivery::NotApplicable);
     }
-    match structured_delivery_mode(args, structured) {
-        Some(delivery) => return Some(delivery),
-        None => {}
+    if let Some(delivery) = structured_delivery_mode(args, structured) {
+        return Some(delivery);
     }
     match raw_path {
         Some(path) if path.ends_with("_fg") => Some(ActualDelivery::Foreground),
@@ -1010,6 +1142,7 @@ fn transport_name(transport: ActionTransport) -> &'static str {
         ActionTransport::MacosAxWindowFrame => "macos_ax_window_frame",
         ActionTransport::MacosCgEventPid => "macos_cg_event_pid",
         ActionTransport::MacosCgEventHid => "macos_cg_event_hid",
+        ActionTransport::MacosAppleEvent => "macos_apple_event",
         ActionTransport::WindowsUiaInvoke => "windows_uia_invoke",
         ActionTransport::WindowsUiaToggle => "windows_uia_toggle",
         ActionTransport::WindowsUiaSelection => "windows_uia_selection",
@@ -1029,6 +1162,7 @@ fn transport_name(transport: ActionTransport) -> &'static str {
         ActionTransport::LinuxPty => "linux_pty",
         ActionTransport::LinuxXSendEvent => "linux_x_send_event",
         ActionTransport::LinuxXTest => "linux_x_test",
+        ActionTransport::LinuxX11MpxUinput => "linux_x11_mpx_uinput",
         ActionTransport::LinuxLibei => "linux_libei",
         ActionTransport::LinuxWaylandVirtualPointer => "linux_wayland_virtual_pointer",
         ActionTransport::LinuxCuaCompositorInject => "linux_cua_compositor_inject",
@@ -1085,6 +1219,14 @@ impl ActionExecutionRecordBuilder {
 
     pub fn delivered_count(mut self, delivered_count: u32) -> Self {
         self.0.delivered_count = Some(delivered_count);
+        self
+    }
+
+    pub fn refusal(mut self, code: impl Into<String>, hint: Option<String>) -> Self {
+        self.0.refusal = Some(ActionRefusal {
+            code: code.into(),
+            hint,
+        });
         self
     }
 
@@ -1430,7 +1572,7 @@ mod tests {
         .actual_delivery(ActualDelivery::Background)
         .evidence(ActionEvidence {
             kind: EvidenceKind::AccessibilityReadback,
-            detail: "secret request-adjacent diagnostic".to_owned(),
+            detail: "value read back as 42".to_owned(),
         })
         .detail("pid=42 window_id=7 x=10 y=20")
         .build()
@@ -1445,12 +1587,11 @@ mod tests {
                 "effect": "confirmed",
                 "route": "accessibility",
                 "delivery": {"mode": "background"},
-                "evidence": [{"kind": "value_readback"}]
+                "evidence": [{"kind": "value_readback", "detail": "value read back as 42"}]
             })
         );
         let rendered = value.to_string();
         for forbidden in [
-            "secret",
             "pid",
             "window_id",
             "\"x\"",
@@ -1488,9 +1629,77 @@ mod tests {
                 "effect": "confirmed",
                 "route": "system_api",
                 "delivery": {"mode": "not_applicable"},
-                "evidence": [{"kind": "value_readback"}]
+                "evidence": [{"kind": "value_readback", "detail": "GetWindowRect matched exact HWND geometry"}]
             })
         );
+    }
+
+    /// What every `move_cursor` producer publishes: only a cursor moved, so
+    /// no effect is provable and no app delivery applies. The route is
+    /// global input for the user's real pointer and synthetic events for the
+    /// drawn agent cursor, including window-target hover moves.
+    #[test]
+    fn move_cursor_publishes_the_pinned_cursor_projection() {
+        let projection = |route: &str| {
+            serde_json::json!({
+                "effect": "unverifiable",
+                "route": route,
+                "delivery": {"mode": "not_applicable"},
+            })
+        };
+        let cases = [
+            (ActionTransport::MacosCgEventHid, "global_input"),
+            (ActionTransport::WindowsSetCursorPos, "global_input"),
+            (ActionTransport::LinuxWaylandVirtualPointer, "global_input"),
+            (ActionTransport::LinuxXTest, "global_input"),
+            (ActionTransport::AgentCursorOverlay, "synthetic_events"),
+        ];
+        for (transport, route) in cases {
+            let record = ActionExecutionRecord::cursor_move(transport, &serde_json::json!({}));
+            assert_eq!(
+                serde_json::to_value(record.public_result().unwrap()).unwrap(),
+                projection(route),
+                "{transport:?}"
+            );
+        }
+    }
+
+    /// A `move_cursor` producer builds its own record; a text-only result
+    /// no longer normalizes, so a producer that drops its record fails at
+    /// the dispatch seam instead of publishing a guessed route.
+    #[test]
+    fn move_cursor_is_not_interpreted_from_legacy_payloads() {
+        for args in [
+            serde_json::json!({"x": 1, "y": 1}),
+            serde_json::json!({"x": 1, "y": 1, "scope": "desktop"}),
+        ] {
+            assert_eq!(
+                ActionExecutionRecord::from_legacy("move_cursor", &args, &serde_json::Value::Null),
+                None,
+                "{args}"
+            );
+        }
+    }
+
+    /// A refused agent-cursor move, such as macOS without its overlay
+    /// host, still records a refusal on the overlay route.
+    #[test]
+    fn move_cursor_refusal_normalizes_on_the_overlay_route() {
+        let record = ActionExecutionRecord::from_legacy(
+            "move_cursor",
+            &serde_json::json!({"x": 10, "y": 20}),
+            &serde_json::json!({
+                "status": "refused",
+                "refusal": {
+                    "code": "facility_unavailable",
+                    "facility": "macos_cursor_overlay",
+                    "message": "macOS agent cursor overlay is unavailable",
+                }
+            }),
+        )
+        .expect("a move_cursor refusal normalizes");
+        assert_eq!(record.effect, ActionEffect::Refused);
+        assert_eq!(record.transport, ActionTransport::AgentCursorOverlay);
     }
 
     #[test]
@@ -1575,6 +1784,102 @@ mod tests {
     }
 
     #[test]
+    fn linux_set_value_keyboard_fallback_paths_normalize() {
+        // A successful set_value fallback must carry an execution record;
+        // without a transport the registry reports action_outcome_mismatch.
+        for (path, mode, transport, delivery) in [
+            (
+                "click_type_fg",
+                "foreground",
+                ActionTransport::LinuxXTest,
+                ActualDelivery::Foreground,
+            ),
+            (
+                "click_select_fg",
+                "foreground",
+                ActionTransport::LinuxXTest,
+                ActualDelivery::Foreground,
+            ),
+            (
+                "click_type_mpx",
+                "background",
+                ActionTransport::LinuxX11MpxUinput,
+                ActualDelivery::Background,
+            ),
+            (
+                "click_select_mpx",
+                "background",
+                ActionTransport::LinuxX11MpxUinput,
+                ActualDelivery::Background,
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "set_value",
+                &serde_json::json!({ "delivery_mode": mode }),
+                &serde_json::json!({ "path": path, "verified": false, "effect": "unverifiable" }),
+            )
+            .unwrap_or_else(|| panic!("{path} should normalize"));
+            assert_eq!(record.transport, transport, "{path}");
+            assert_eq!(record.actual_delivery, Some(delivery), "{path}");
+            record.public_result().expect("public result");
+        }
+    }
+
+    #[test]
+    fn mpx_pointer_window_change_evidence_publishes_confirmed_effect() {
+        // Linux MPX real-pointer click that opened a context menu: the popup
+        // appearing is window-change evidence, so `confirmed` survives.
+        let record = ActionExecutionRecord::from_legacy(
+            "right_click",
+            &serde_json::json!({"delivery_mode": "background"}),
+            &serde_json::json!({
+                "path": "mpx_pointer",
+                "verified": true,
+                "effect": "confirmed",
+                "evidence": [
+                    {"kind": "window_change", "detail": "1 popup window(s) appeared"},
+                    {"kind": "screenshot_comparison", "detail": "4.4% of the region changed"}
+                ],
+            }),
+        )
+        .expect("mpx pointer click should normalize");
+        assert_eq!(record.transport, ActionTransport::LinuxX11MpxUinput);
+        assert_eq!(record.effect, ActionEffect::Confirmed);
+        assert_eq!(record.evidence.len(), 2);
+        let public = record.public_result().expect("public result");
+        assert_eq!(public.effect, cua_driver_contract::ActionEffect::Confirmed);
+        // Only the publishable kind is projected.
+        assert_eq!(public.evidence.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn mpx_pointer_screenshot_evidence_alone_stays_unverifiable() {
+        let record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "background"}),
+            &serde_json::json!({
+                "path": "mpx_pointer",
+                "verified": true,
+                "effect": "confirmed",
+                "evidence": [{"kind": "screenshot_comparison", "detail": "2.8% changed"}],
+            }),
+        )
+        .expect("mpx pointer click should normalize");
+        assert_eq!(record.effect, ActionEffect::Unverifiable);
+        assert_eq!(record.evidence.len(), 1);
+        assert_eq!(
+            ActionExecutionRecord::from_legacy(
+                "drag",
+                &serde_json::json!({"delivery_mode": "background"}),
+                &serde_json::json!({"path": "x11_xsendevent", "verified": false, "effect": "unverifiable"}),
+            )
+            .expect("legacy xsendevent drag should normalize")
+            .transport,
+            ActionTransport::LinuxXSendEvent
+        );
+    }
+
+    #[test]
     fn click_selection_readback_preserves_confirmed_effect() {
         let record = ActionExecutionRecord::from_legacy(
             "click",
@@ -1616,6 +1921,7 @@ mod tests {
                 "ref": "secret-ref",
                 "destination_ref": "secret-destination",
                 "input_route": input_route,
+                "delivery_mode": "foreground",
             });
             let structured = serde_json::json!({
                 "status": "ok",
@@ -1676,6 +1982,13 @@ mod tests {
         assert_eq!(refused.effect, cua_driver_contract::ActionEffect::Refused);
         assert!(refused.delivery.is_none());
         assert_eq!(
+            refused.error,
+            Some(cua_driver_contract::ActionError {
+                code: "browser_ref_stale".into(),
+                hint: Some("refresh browser state".into()),
+            })
+        );
+        assert_eq!(
             refused.escalation,
             Some(cua_driver_contract::ActionEscalation {
                 target: cua_driver_contract::ActionEscalationTarget::Page,
@@ -1731,6 +2044,34 @@ mod tests {
             Some(cua_driver_contract::ActionDeliveryMode::Foreground)
         );
         assert_eq!(public.route, cua_driver_contract::ActionRoute::GlobalInput);
+    }
+
+    #[test]
+    fn foreground_cgevent_path_is_preserved_when_effect_is_unverifiable() {
+        let record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "foreground"}),
+            &serde_json::json!({
+                "path": "cgevent_fg",
+                "verified": false,
+                "effect": "unverifiable",
+            }),
+        )
+        .expect("foreground CGEvent result should normalize");
+
+        assert_eq!(record.transport, ActionTransport::MacosCgEventHid);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Foreground));
+
+        let public = record.public_result().expect("public ActionResult");
+        assert_eq!(
+            public.effect,
+            cua_driver_contract::ActionEffect::Unverifiable
+        );
+        assert_eq!(public.route, cua_driver_contract::ActionRoute::GlobalInput);
+        assert_eq!(
+            public.delivery.map(|delivery| delivery.mode),
+            Some(cua_driver_contract::ActionDeliveryMode::Foreground)
+        );
     }
 
     #[test]
@@ -1812,7 +2153,6 @@ mod tests {
             "post_message",
             "PostMessage",
             "SendInput",
-            "SetCursorPos",
             "atspi",
             "wayland_atspi",
             "x11_atspi",
@@ -1822,6 +2162,7 @@ mod tests {
             "x11_xtest_fg",
             "xtest",
             "xtest_desktop",
+            "xtest_core_grab",
             "wayland_activate",
             "wayland_focused",
             "wayland_desktop",
@@ -1831,6 +2172,7 @@ mod tests {
             "cgevent_hid",
             "cgevent",
             "cgevent_fg",
+            "appkit_activated",
             "dom_event",
             "trusted",
             "key_events",
@@ -1854,6 +2196,22 @@ mod tests {
     }
 
     #[test]
+    fn foreground_macos_drag_path_uses_hid_transport() {
+        let record = ActionExecutionRecord::from_legacy(
+            "drag",
+            &serde_json::json!({"delivery_mode": "foreground"}),
+            &serde_json::json!({
+                "path": "cgevent_hid",
+                "effect": "unverifiable",
+            }),
+        )
+        .expect("foreground macOS drag should normalize");
+
+        assert_eq!(record.transport, ActionTransport::MacosCgEventHid);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Foreground));
+    }
+
+    #[test]
     fn every_legacy_text_only_action_is_conservatively_unverifiable() {
         let tools = [
             "click",
@@ -1863,7 +2221,6 @@ mod tests {
             "drag",
             "mouse_drag",
             "parallel_mouse_drag",
-            "move_cursor",
             "mouse_button_down",
             "mouse_button_up",
             "type_text",
